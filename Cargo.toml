@@ -1,0 +1,41 @@
+[package]
+name = "arisu"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+gui = ["objc2-app-kit"]
+
+[dependencies]
+anyhow = "1.0.94"
+async-trait = "0.1.83"
+clap = { version = "4.5.23", features = ["derive"] }
+ironrdp = { version = "0.9.1", features = ["cliprdr", "rdpsnd", "server", "connector"] }
+ironrdp-cliprdr-native = { version = "0.1.0" }
+screencapturekit = "0.3.5"
+core-graphics-types = "*"
+strum = { version = "0.26.3", features = ["derive"] }
+tokio = { version = "*", features = ["macros"] }
+objc = "*"
+tracing = "0.1.41"
+tracing-subscriber = { version = "*", features = ["env-filter"] }
+
+ratatui = { version = "0.29", optional = true }
+
+objc2-core-foundation = "*"
+objc2-core-graphics = "*"
+objc2-app-kit = { version = "*", optional = true }
+cfg-if = "1.0.0"
+triple_buffer = "8.1.1"
+bytes = "1.10.1"
+
+[patch.crates-io]
+ironrdp = { path = "../IronRDP/crates/ironrdp" }
+screencapturekit = { path = "../screencapturekit-rs" }
+
+[package.metadata.bundle]
+name = "ARISU"
+identifier = "app.perlmint.arisu"
+version = "0.1.0"
+
