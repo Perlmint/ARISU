@@ -11,7 +11,7 @@ use screencapturekit::{
     stream::{output_trait::SCStreamOutputTrait, output_type::SCStreamOutputType},
 };
 use std::{cell::RefCell, num::NonZeroU16, sync::Arc};
-use tokio::sync::{mpsc, oneshot, Notify, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
 use crate::{counter::IntervalCounter, screen::ScreenJob};
 
@@ -39,6 +39,7 @@ pub(super) struct DisplayUpdates {
     capture_receiver: triple_buffer::Output<CapturedData>,
     display_size: watch::Receiver<ScreenSize>,
     update_notification: Arc<Notify>,
+    send_counter: IntervalCounter,
 }
 
 impl Drop for DisplayUpdates {
@@ -71,6 +72,7 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
             },
             buffer.as_ptr()
         );
+        self.send_counter.update();
         Some(DisplayUpdate::Bitmap(BitmapUpdate {
             x: *x,
             y: *y,
@@ -108,7 +110,6 @@ impl RdpServerDisplay for super::ScreenCapture {
             .await?;
         tracing::info!("Starting capture requested");
         let received = receiver.await??;
-        self.counter.update();
 
         Ok(Box::new(received))
     }
@@ -122,7 +123,10 @@ impl RdpServerDisplay for super::ScreenCapture {
             let device_scale_factor = layout.device_scale_factor();
             let desktop_scale_factor = layout.desktop_scale_factor();
             tracing::info!(?width, ?height, ?device_scale_factor, ?desktop_scale_factor);
-            if let Err(e) = self.job_sender.try_send(ScreenJob::Display(Job::SetSize(width as _, height as _))) {
+            if let Err(e) = self
+                .job_sender
+                .try_send(ScreenJob::Display(Job::SetSize(width as _, height as _)))
+            {
                 tracing::error!("Failed to send display size job: {e:?}");
             }
         }
@@ -181,7 +185,7 @@ fn convert_buffer(
 struct DisplayCaptureDelegate {
     sender: RefCell<triple_buffer::Input<CapturedData>>,
     update_notifier: Arc<Notify>,
-    counter: RefCell<IntervalCounter>,
+    capture_counter: RefCell<IntervalCounter>,
 }
 
 impl SCStreamOutputTrait for DisplayCaptureDelegate {
@@ -244,7 +248,7 @@ impl SCStreamOutputTrait for DisplayCaptureDelegate {
             }
             input_buffer.publish();
             self.update_notifier.notify_waiters();
-            self.counter.borrow_mut().update();
+            self.capture_counter.borrow_mut().update();
         }
     }
 }
@@ -285,7 +289,9 @@ impl super::ScreenCaptureContext {
                 let screen_size = *self.display_size.borrow();
                 let (capture_sender, capture_receiver) =
                     triple_buffer::triple_buffer(&CapturedData {
-                        data: Vec::with_capacity((4 * screen_size.server.0 * screen_size.server.1) as usize),
+                        data: Vec::with_capacity(
+                            (4 * screen_size.server.0 * screen_size.server.1) as usize,
+                        ),
                         width: screen_size.server.0 as _,
                         height: screen_size.server.1 as _,
                         x: 0,
@@ -295,7 +301,7 @@ impl super::ScreenCaptureContext {
                 let delegate = DisplayCaptureDelegate {
                     sender: RefCell::new(capture_sender),
                     update_notifier: update_notification.clone(),
-                    counter: RefCell::new(self.counter.clone()),
+                    capture_counter: RefCell::new(self.capture_counter.clone()),
                 };
                 let ret = self
                     .stream
@@ -307,6 +313,7 @@ impl super::ScreenCaptureContext {
                         update_notification,
                         capture_receiver,
                         display_size: self.display_size.subscribe(),
+                        send_counter: self.send_counter.clone(),
                     });
                 tracing::info!("Display capture started");
                 if sender.send(ret).is_err() {

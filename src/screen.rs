@@ -1,7 +1,7 @@
 use ironrdp::server::ServerEvent;
 use objc::runtime::Object;
 use screencapturekit::{
-    shareable_content::{SCShareableContent},
+    shareable_content::SCShareableContent,
     stream::{
         configuration::{pixel_format::PixelFormat, SCStreamConfiguration},
         content_filter::SCContentFilter,
@@ -48,7 +48,6 @@ pub struct ScreenSize {
 pub struct ScreenCapture {
     job_sender: mpsc::Sender<ScreenJob>,
     rdp_event_sender: Arc<RwLock<Option<mpsc::UnboundedSender<ServerEvent>>>>,
-    counter: IntervalCounter,
     screen_size: watch::Receiver<ScreenSize>,
 }
 
@@ -56,7 +55,8 @@ struct ScreenCaptureContext {
     job_sender: mpsc::Sender<ScreenJob>,
     display_size: watch::Sender<ScreenSize>,
     rdp_event_sender: Arc<RwLock<Option<mpsc::UnboundedSender<ServerEvent>>>>,
-    counter: IntervalCounter,
+    capture_counter: IntervalCounter,
+    send_counter: IntervalCounter,
     stream: SCStream,
 }
 
@@ -106,7 +106,8 @@ impl ScreenCapture {
         let mut context = ScreenCaptureContext {
             job_sender: screen_chnnal.0.clone(),
             rdp_event_sender: rdp_event_sender.clone(),
-            counter: capture_counter,
+            capture_counter,
+            send_counter: display_send_counter,
             display_size,
             stream,
         };
@@ -132,7 +133,6 @@ impl ScreenCapture {
             Self {
                 job_sender: screen_chnnal.0,
                 rdp_event_sender,
-                counter: display_send_counter,
                 screen_size,
             },
             handle,
