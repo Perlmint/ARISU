@@ -65,8 +65,8 @@ impl ScreenCapture {
         let config = SCStreamConfiguration::new()
             .set_captures_audio(true)
             .map_err(|e| anyhow::anyhow!("Failed to setCapturesAudio - {e:?}"))?
-            .set_sample_rate(sound::SAMPLE_RATE as _)
-            .map_err(|e| anyhow::anyhow!("Failed to setSampleRate - {e:?}"))?
+            // .set_sample_rate(sound::SAMPLE_RATE as _)
+            // .map_err(|e| anyhow::anyhow!("Failed to setSampleRate - {e:?}"))?
             .set_channel_count(sound::CHANNELS as _)
             .map_err(|e| anyhow::anyhow!("Failed to setChannelCount - {e:?}"))?
             .set_pixel_format(PixelFormat::BGRA)

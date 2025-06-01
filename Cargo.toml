@@ -11,8 +11,8 @@ gui = ["objc2-app-kit"]
 anyhow = "1.0.94"
 async-trait = "0.1.83"
 clap = { version = "4.5.23", features = ["derive"] }
-ironrdp = { version = "0.9.1", features = ["cliprdr", "rdpsnd", "server", "connector"] }
-ironrdp-cliprdr-native = { version = "0.1.0" }
+ironrdp = { version = "0.10.0", features = ["cliprdr", "rdpsnd", "server", "connector", "displaycontrol"] }
+# ironrdp-cliprdr-native = { version = "0.1.0" }
 screencapturekit = "0.3.5"
 core-graphics-types = "*"
 strum = { version = "0.26.3", features = ["derive"] }
@@ -31,8 +31,8 @@ triple_buffer = "8.1.1"
 bytes = "1.10.1"
 
 [patch.crates-io]
-ironrdp = { path = "../IronRDP/crates/ironrdp" }
-screencapturekit = { path = "../screencapturekit-rs" }
+# ironrdp = { path = "../IronRDP/crates/ironrdp" }
+# screencapturekit = { path = "../screencapturekit-rs" }
 
 [package.metadata.bundle]
 name = "ARISU"
