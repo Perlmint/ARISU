@@ -144,9 +144,11 @@ dependencies = [
  "core-graphics-types",
  "ironrdp",
  "objc",
+ "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "objc2-foundation",
  "ratatui",
  "screencapturekit",
  "strum",
@@ -2430,6 +2432,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "900831247d2fe1a09a683278e5384cfb8c80c79fe6b166f9d14bfdde0ea1b03c"
 dependencies = [
  "bitflags 2.9.1",
+ "block2",
+ "libc",
  "objc2",
  "objc2-core-foundation",
 ]
