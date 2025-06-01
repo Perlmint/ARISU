@@ -1,8 +1,7 @@
-use anyhow::{anyhow, Context as _};
 use ironrdp::server::ServerEvent;
 use objc::runtime::Object;
 use screencapturekit::{
-    shareable_content::{SCDisplay, SCShareableContent},
+    shareable_content::{SCShareableContent},
     stream::{
         configuration::{pixel_format::PixelFormat, SCStreamConfiguration},
         content_filter::SCContentFilter,
@@ -11,12 +10,11 @@ use screencapturekit::{
 };
 use std::sync::{Arc, RwLock};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, watch},
     task::{JoinHandle, LocalSet},
 };
-use tracing::error;
 
-use crate::counter::IntervalCounter;
+use crate::{counter::IntervalCounter, input::InputHandler};
 
 mod display;
 
@@ -40,19 +38,25 @@ enum ScreenJob {
     Sound(sound::Job),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ScreenSize {
+    pub client: (u16, u16),
+    pub server: (u16, u16),
+}
+
 #[derive(Clone)]
 pub struct ScreenCapture {
     job_sender: mpsc::Sender<ScreenJob>,
     rdp_event_sender: Arc<RwLock<Option<mpsc::UnboundedSender<ServerEvent>>>>,
     counter: IntervalCounter,
+    screen_size: watch::Receiver<ScreenSize>,
 }
 
 struct ScreenCaptureContext {
     job_sender: mpsc::Sender<ScreenJob>,
+    display_size: watch::Sender<ScreenSize>,
     rdp_event_sender: Arc<RwLock<Option<mpsc::UnboundedSender<ServerEvent>>>>,
     counter: IntervalCounter,
-    width: u32,
-    height: u32,
     stream: SCStream,
 }
 
@@ -87,9 +91,13 @@ impl ScreenCapture {
             &[],
             &[],
         );
-        let width = display.width();
-        let height = display.height();
+        let width = display.width() as u16;
+        let height = display.height() as u16;
         tracing::info!("screen initial size - width: {width}, height: {height}");
+        let (display_size, screen_size) = watch::channel(ScreenSize {
+            client: (width, height),
+            server: (width, height),
+        });
         let stream = SCStream::new(&filter, &config);
         stream
             .start_capture()
@@ -99,8 +107,7 @@ impl ScreenCapture {
             job_sender: screen_chnnal.0.clone(),
             rdp_event_sender: rdp_event_sender.clone(),
             counter: capture_counter,
-            width,
-            height,
+            display_size,
             stream,
         };
         let handle = main_thread_local_set.spawn_local(async move {
@@ -126,8 +133,13 @@ impl ScreenCapture {
                 job_sender: screen_chnnal.0,
                 rdp_event_sender,
                 counter: display_send_counter,
+                screen_size,
             },
             handle,
         ))
+    }
+
+    pub fn input_handler(&self) -> InputHandler {
+        InputHandler::new(self.screen_size.clone())
     }
 }

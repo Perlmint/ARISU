@@ -4,11 +4,15 @@ use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGMouseButton, CGScrollEventUnit,
 };
+use tokio::sync::watch;
+
+use crate::screen::ScreenSize;
 
 pub struct InputHandler {
     last_mouse_point: CGPoint,
     down_mouse_button: Option<CGMouseButton>,
     modifier_state: Modifiers,
+    client_screen_size: watch::Receiver<ScreenSize>,
 }
 
 #[derive(Default, Debug)]
@@ -20,11 +24,12 @@ struct Modifiers {
 }
 
 impl InputHandler {
-    pub fn new() -> Self {
+    pub fn new(client_screen_size: watch::Receiver<ScreenSize>) -> Self {
         Self {
             last_mouse_point: CGPoint { x: 0.0, y: 0.0 },
             down_mouse_button: None,
             modifier_state: Default::default(),
+            client_screen_size,
         }
     }
 
@@ -260,8 +265,11 @@ impl RdpServerInputHandler for InputHandler {
                 }
             }
             MouseEvent::Move { x, y } => {
-                self.last_mouse_point.x = x as _;
-                self.last_mouse_point.y = y as _;
+                let screen_size = *self.client_screen_size.borrow_and_update();
+                self.last_mouse_point.x =
+                    (x as u32 * screen_size.server.0 as u32) as f64 / screen_size.client.0 as f64;
+                self.last_mouse_point.y =
+                    (y as u32 * screen_size.server.1 as u32) as f64 / screen_size.client.1 as f64;
 
                 if let Some(down_button) = &self.down_mouse_button {
                     let down_button = *down_button;

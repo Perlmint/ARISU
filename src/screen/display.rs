@@ -1,6 +1,5 @@
 use anyhow::Context as _;
 use bytes::Bytes;
-use core_graphics_types::geometry::CGRect;
 use ironrdp::server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates,
 };
@@ -11,15 +10,16 @@ use screencapturekit::{
     },
     stream::{output_trait::SCStreamOutputTrait, output_type::SCStreamOutputType},
 };
-use std::{cell::RefCell, num::NonZeroU16, ops::DerefMut, sync::Arc};
-use tokio::sync::{mpsc, oneshot, Notify};
+use std::{cell::RefCell, num::NonZeroU16, sync::Arc};
+use tokio::sync::{mpsc, oneshot, Notify, watch};
 
 use crate::{counter::IntervalCounter, screen::ScreenJob};
 
-use super::ScreenOutputIndex;
+use super::{ScreenOutputIndex, ScreenSize};
 
 pub(super) enum Job {
-    Size(oneshot::Sender<(usize, usize)>),
+    GetSize(oneshot::Sender<(u16, u16)>),
+    SetSize(u16, u16),
     CaptureStart(oneshot::Sender<anyhow::Result<DisplayUpdates>>),
     CaptureStop(ScreenOutputIndex),
 }
@@ -37,6 +37,7 @@ pub(super) struct DisplayUpdates {
     index: ScreenOutputIndex,
     display_sender: mpsc::Sender<ScreenJob>,
     capture_receiver: triple_buffer::Output<CapturedData>,
+    display_size: watch::Receiver<ScreenSize>,
     update_notification: Arc<Notify>,
 }
 
@@ -87,7 +88,7 @@ impl RdpServerDisplay for super::ScreenCapture {
     async fn size(&mut self) -> DesktopSize {
         let (sender, receiver) = oneshot::channel();
         self.job_sender
-            .send(ScreenJob::Display(Job::Size(sender)))
+            .send(ScreenJob::Display(Job::GetSize(sender)))
             .await
             .unwrap_or_else(|e| panic!("Failed to send display job to main thread - {e:?}"));
         let (width, height) = receiver
@@ -110,6 +111,21 @@ impl RdpServerDisplay for super::ScreenCapture {
         self.counter.update();
 
         Ok(Box::new(received))
+    }
+
+    fn request_layout(
+        &mut self,
+        layout: ironrdp::displaycontrol::pdu::DisplayControlMonitorLayout,
+    ) {
+        for layout in layout.monitors().iter() {
+            let (width, height) = layout.dimensions();
+            let device_scale_factor = layout.device_scale_factor();
+            let desktop_scale_factor = layout.desktop_scale_factor();
+            tracing::info!(?width, ?height, ?device_scale_factor, ?desktop_scale_factor);
+            if let Err(e) = self.job_sender.try_send(ScreenJob::Display(Job::SetSize(width as _, height as _))) {
+                tracing::error!("Failed to send display size job: {e:?}");
+            }
+        }
     }
 }
 
@@ -236,18 +252,42 @@ impl SCStreamOutputTrait for DisplayCaptureDelegate {
 impl super::ScreenCaptureContext {
     pub(crate) fn handle_display_job(&mut self, job: Job) {
         match job {
-            Job::Size(sender) => {
+            Job::GetSize(sender) => {
                 tracing::trace!("Requsted display size");
-                if let Err(e) = sender.send((self.width as usize, self.height as usize)) {
+                let screen_size = *self.display_size.borrow();
+                if let Err(e) = sender.send((screen_size.server.0, screen_size.server.1)) {
                     tracing::error!("Failed to send display size: {e:?}");
                 }
             }
+            Job::SetSize(width, height) => {
+                // use objc2_core_graphics::{CGGetActiveDisplayList, CGDisplayCopyDisplayMode, CGDisplayMode, CGDirectDisplayID};
+                // let mut active_displays = std::mem::MaybeUninit::<[CGDirectDisplayID; 1]>::uninit();
+                // let mut display_count = std::mem::MaybeUninit::<u32>::uninit();
+                // unsafe { CGGetActiveDisplayList(1, &raw mut (&mut *active_displays.as_mut_ptr())[0], display_count.as_mut_ptr()) };
+                // let active_displays = unsafe { active_displays.assume_init() };
+                // let display_count = unsafe { display_count.assume_init() };
+                // if display_count == 0 {
+                //     panic!("No active displays found");
+                // }
+                // let display = active_displays[0];
+                // let display_mode = unsafe { CGDisplayCopyDisplayMode(display) }.unwrap();
+                self.display_size.send_if_modified(|screen_size| {
+                    if screen_size.client != (width, height) {
+                        tracing::info!("Client display size changed: {} x {}", width, height);
+                        screen_size.client = (width, height);
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
             Job::CaptureStart(sender) => {
+                let screen_size = *self.display_size.borrow();
                 let (capture_sender, capture_receiver) =
                     triple_buffer::triple_buffer(&CapturedData {
-                        data: Vec::with_capacity((4 * self.width * self.height) as usize),
-                        width: self.width as _,
-                        height: self.height as _,
+                        data: Vec::with_capacity((4 * screen_size.server.0 * screen_size.server.1) as usize),
+                        width: screen_size.server.0 as _,
+                        height: screen_size.server.1 as _,
                         x: 0,
                         y: 0,
                     });
@@ -266,6 +306,7 @@ impl super::ScreenCaptureContext {
                         display_sender: self.job_sender.clone(),
                         update_notification,
                         capture_receiver,
+                        display_size: self.display_size.subscribe(),
                     });
                 tracing::info!("Display capture started");
                 if sender.send(ret).is_err() {

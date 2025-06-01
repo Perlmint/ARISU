@@ -4,7 +4,6 @@ use anyhow::Context as _;
 use clap::Parser;
 // use clipboard::StubCliprdrServerFactory;
 use counter::IntervalCounter;
-use input::InputHandler;
 use ironrdp::server::{Credentials, RdpServer, TlsIdentityCtx};
 use screen::ScreenCapture;
 use strum::EnumString;
@@ -62,7 +61,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let server_handle = join_set.spawn_local_on(
+    let _server_handle = join_set.spawn_local_on(
         async move {
             let local_set = tokio::task::LocalSet::new();
             let security = args.security;
@@ -98,7 +97,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 ScreenCapture::new(&local_set, capture_counter, display_send_counter)?;
 
             let mut server = server_builder
-                .with_input_handler(InputHandler::new())
+                .with_input_handler(screen_handler.input_handler())
                 .with_display_handler(screen_handler.clone())
                 // .with_cliprdr_factory(Some(cliprdr))
                 // .with_sound_factory(Some(Box::new(screen_handler)))
