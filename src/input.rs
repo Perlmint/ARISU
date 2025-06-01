@@ -79,6 +79,11 @@ impl InputHandler {
                     modifier.shift = pressed;
                     0x38
                 }
+                // Left alt/option
+                (56, false) => {
+                    modifier.option = pressed;
+                    0x3A
+                }
                 // Return
                 (28, false) => 0x24,
                 // qwertyuiop
