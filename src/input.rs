@@ -2,9 +2,7 @@ use anyhow::Context;
 use ironrdp::server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::{
-    CGEvent, CGEventCreateKeyboardEvent, CGEventCreateScrollWheelEvent2, CGEventFlags,
-    CGEventKeyboardSetUnicodeString, CGEventPost, CGEventSetFlags, CGEventSource,
-    CGEventSourceStateID, CGEventTapLocation, CGMouseButton, CGScrollEventUnit,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGMouseButton, CGScrollEventUnit,
 };
 
 pub struct InputHandler {
@@ -45,7 +43,7 @@ impl InputHandler {
             flags |= CGEventFlags::MaskShift;
         }
         if flags.0 != 0 {
-            unsafe { CGEventSetFlags(Some(event.as_ref()), flags) };
+            unsafe { CGEvent::set_flags(Some(event.as_ref()), flags) };
         }
         event
     }
@@ -171,31 +169,31 @@ impl InputHandler {
             KeyboardEvent::Pressed { code, extended } => {
                 let code = convert_non_unicode_key(code, extended, true, &mut self.modifier_state)
                     .with_context(|| format!("Unknown code - {code}, {extended}"))?;
-                unsafe { CGEventCreateKeyboardEvent(None, code, true) }
+                unsafe { CGEvent::new_keyboard_event(None, code, true) }
                     .map(|event| self.apply_modifier_to_event(event))
             }
             .ok_or_else(|| anyhow::anyhow!("Failed to convert keyboard pressed event")),
             KeyboardEvent::Released { code, extended } => {
                 let code = convert_non_unicode_key(code, extended, false, &mut self.modifier_state)
                     .with_context(|| format!("Unknown code - {code}, {extended}"))?;
-                (unsafe { CGEventCreateKeyboardEvent(None, code, false) })
+                (unsafe { CGEvent::new_keyboard_event(None, code, false) })
                     .map(|event| self.apply_modifier_to_event(event))
                     .ok_or_else(|| anyhow::anyhow!("Failed to convert keyboard pressed event"))
             }
             KeyboardEvent::UnicodePressed(code) => {
                 let event =
-                    unsafe { CGEventCreateKeyboardEvent(None, 0, true) }.ok_or_else(|| {
+                    unsafe { CGEvent::new_keyboard_event(None, 0, true) }.ok_or_else(|| {
                         anyhow::anyhow!("Failed to convert keyboard event - {event:?}")
                     })?;
-                unsafe { CGEventKeyboardSetUnicodeString(Some(event.as_ref()), 1, &code) };
+                unsafe { CGEvent::keyboard_set_unicode_string(Some(event.as_ref()), 1, &code) };
                 Ok(event)
             }
             KeyboardEvent::UnicodeReleased(code) => {
                 let event =
-                    unsafe { CGEventCreateKeyboardEvent(None, 0, false) }.ok_or_else(|| {
+                    unsafe { CGEvent::new_keyboard_event(None, 0, false) }.ok_or_else(|| {
                         anyhow::anyhow!("Failed to convert keyboard event - {event:?}")
                     })?;
-                unsafe { CGEventKeyboardSetUnicodeString(Some(event.as_ref()), 1, &code) };
+                unsafe { CGEvent::keyboard_set_unicode_string(Some(event.as_ref()), 1, &code) };
                 Ok(event)
             }
             _ => Err(anyhow::anyhow!("Unhandled event - {event:?}")),
@@ -211,18 +209,16 @@ impl RdpServerInputHandler for InputHandler {
         else {
             return;
         };
-        unsafe { CGEventPost(CGEventTapLocation::SessionEventTap, Some(&event)) };
+        unsafe { CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event)) };
     }
 
     fn mouse(&mut self, event: MouseEvent) {
-        use objc2_core_graphics::{
-            CGDisplayMoveCursorToPoint, CGEventCreateMouseEvent, CGEventType,
-        };
+        use objc2_core_graphics::{CGDisplayMoveCursorToPoint, CGEventType};
         let event = match event {
             MouseEvent::LeftPressed => {
                 self.down_mouse_button = Some(CGMouseButton::Left);
                 unsafe {
-                    CGEventCreateMouseEvent(
+                    CGEvent::new_mouse_event(
                         None,
                         CGEventType::LeftMouseDown,
                         self.last_mouse_point,
@@ -233,7 +229,7 @@ impl RdpServerInputHandler for InputHandler {
             MouseEvent::LeftReleased => {
                 self.down_mouse_button = None;
                 unsafe {
-                    CGEventCreateMouseEvent(
+                    CGEvent::new_mouse_event(
                         None,
                         CGEventType::LeftMouseUp,
                         self.last_mouse_point,
@@ -244,7 +240,7 @@ impl RdpServerInputHandler for InputHandler {
             MouseEvent::RightPressed => {
                 self.down_mouse_button = Some(CGMouseButton::Right);
                 unsafe {
-                    CGEventCreateMouseEvent(
+                    CGEvent::new_mouse_event(
                         None,
                         CGEventType::RightMouseDown,
                         self.last_mouse_point,
@@ -255,7 +251,7 @@ impl RdpServerInputHandler for InputHandler {
             MouseEvent::RightReleased => {
                 self.down_mouse_button = None;
                 unsafe {
-                    CGEventCreateMouseEvent(
+                    CGEvent::new_mouse_event(
                         None,
                         CGEventType::RightMouseUp,
                         self.last_mouse_point,
@@ -270,7 +266,7 @@ impl RdpServerInputHandler for InputHandler {
                 if let Some(down_button) = &self.down_mouse_button {
                     let down_button = *down_button;
                     unsafe {
-                        CGEventCreateMouseEvent(
+                        CGEvent::new_mouse_event(
                             None,
                             match down_button {
                                 CGMouseButton::Left => CGEventType::LeftMouseDragged,
@@ -293,7 +289,14 @@ impl RdpServerInputHandler for InputHandler {
                 }
             }
             MouseEvent::VerticalScroll { value } => unsafe {
-                CGEventCreateScrollWheelEvent2(None, CGScrollEventUnit::Pixel, 1, value as _, 0, 0)
+                CGEvent::new_scroll_wheel_event2(
+                    None,
+                    CGScrollEventUnit::Pixel,
+                    1,
+                    value as _,
+                    0,
+                    0,
+                )
             },
             _ => {
                 tracing::info!("Unknown mouse event {event:?}");
@@ -304,6 +307,6 @@ impl RdpServerInputHandler for InputHandler {
             tracing::error!("Failed to create mouse event");
             return;
         };
-        unsafe { CGEventPost(CGEventTapLocation::SessionEventTap, Some(&event)) };
+        unsafe { CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event)) };
     }
 }
