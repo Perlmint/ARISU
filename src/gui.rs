@@ -6,12 +6,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSImage, NSMenu,
-    NSStatusBar, NSStatusBarButton, NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSImage, NSStatusBar,
+    NSStatusBarButton, NSVariableStatusItemLength,
 };
-use objc2_foundation::{
-    NSNotification, NSObject, NSObjectProtocol, NSString, NSTimeInterval, NSTimer,
-};
+use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString, NSTimer};
 
 struct Ivars {
     capture_interval: Interval,
