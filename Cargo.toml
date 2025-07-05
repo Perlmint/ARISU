@@ -39,4 +39,5 @@ objc2 = "0.6.1"
 name = "ARISU"
 identifier = "app.perlmint.arisu"
 version = "0.1.0"
+osx_info_plist_exts = ["Info.plist"]
 
