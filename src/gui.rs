@@ -1,7 +1,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 use std::cell::RefCell;
 
-use crate::counter::Interval;
+use crate::{config::Config, counter::Interval};
+
+mod settings;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -10,6 +12,7 @@ use objc2_app_kit::{
     NSMenuItem, NSStatusBar, NSStatusBarButton, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString, NSTimer};
+use tracing::{debug, error};
 
 struct UiElements {
     #[allow(dead_code)]
@@ -22,12 +25,15 @@ struct UiElements {
     menu: Retained<NSMenu>, // Kept alive for proper cleanup
     capture_fps_item: Retained<NSMenuItem>,
     send_fps_item: Retained<NSMenuItem>,
+    #[allow(dead_code)]
+    settings_item: Retained<NSMenuItem>,
 }
 
 struct Ivars {
     capture_interval: Interval,
     display_send_interval: Interval,
     ui: RefCell<Option<UiElements>>,
+    config: RefCell<Option<Config>>,
 }
 
 define_class!(
@@ -53,7 +59,7 @@ define_class!(
 
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _notification: &NSNotification) {
-            println!("Will terminate!");
+            debug!("Application will terminate");
         }
     }
 
@@ -69,6 +75,11 @@ define_class!(
             let app = NSApplication::sharedApplication(mtm);
             unsafe { app.terminate(None) };
         }
+
+        #[unsafe(method(openSettings))]
+        fn open_settings(&self) {
+            self.show_settings_dialog();
+        }
     }
 );
 
@@ -83,6 +94,7 @@ impl AppDelegate {
             capture_interval,
             display_send_interval,
             ui: RefCell::new(None),
+            config: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -99,10 +111,10 @@ impl AppDelegate {
                 )
             };
             unsafe { button.setImage(image.as_deref()) };
-            
+
             // Create menu
             let menu = NSMenu::new(mtm);
-            
+
             // Add FPS info items
             let capture_fps_item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -114,7 +126,7 @@ impl AppDelegate {
             };
             unsafe { capture_fps_item.setEnabled(false) };
             menu.addItem(&capture_fps_item);
-            
+
             let send_fps_item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
                     NSMenuItem::alloc(mtm),
@@ -125,11 +137,23 @@ impl AppDelegate {
             };
             unsafe { send_fps_item.setEnabled(false) };
             menu.addItem(&send_fps_item);
-            
+
             // Add separator
             let separator = NSMenuItem::separatorItem(mtm);
             menu.addItem(&separator);
-            
+
+            // Add settings item
+            let settings_item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("Settings..."),
+                    Some(sel!(openSettings)),
+                    &NSString::from_str(","),
+                )
+            };
+            unsafe { settings_item.setTarget(Some(self)) };
+            menu.addItem(&settings_item);
+
             // Add quit item
             let quit_item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -142,7 +166,7 @@ impl AppDelegate {
             unsafe { quit_item.setTarget(Some(self)) };
             menu.addItem(&quit_item);
             unsafe { status_bar_item.setMenu(Some(&menu)) };
-            
+
             let timer = unsafe {
                 NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                     1.0,
@@ -160,7 +184,18 @@ impl AppDelegate {
                 menu,
                 capture_fps_item,
                 send_fps_item,
+                settings_item,
             }));
+
+            // Load config
+            match Config::load() {
+                Ok(config) => {
+                    self.ivars().config.replace(config);
+                }
+                Err(e) => {
+                    error!("Failed to load config: {}", e);
+                }
+            }
         }
     }
 
@@ -180,11 +215,21 @@ impl AppDelegate {
                 "Capture FPS: {:.2}",
                 capture_fps
             )));
-            ui.send_fps_item.setTitle(&NSString::from_str(&format!(
-                "Send FPS: {:.2}",
-                send_fps
-            )));
+            ui.send_fps_item
+                .setTitle(&NSString::from_str(&format!("Send FPS: {:.2}", send_fps)));
         };
+    }
+
+    fn show_settings_dialog(&self) {
+        debug!("Opening settings dialog");
+
+        let mtm = MainThreadMarker::from(self);
+        let current_config = self.ivars().config.borrow();
+        let current_config = current_config.as_ref();
+
+        if let Some(new_config) = settings::show_settings_dialog(mtm, current_config) {
+            self.ivars().config.replace(Some(new_config));
+        }
     }
 }
 

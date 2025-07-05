@@ -9,8 +9,8 @@ use screen::ScreenCapture;
 use strum::EnumString;
 use tracing::error;
 
+mod config;
 mod counter;
-
 // mod clipboard;
 // mod credential;
 mod gui;
