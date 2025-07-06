@@ -107,9 +107,14 @@ impl RdpServerDisplay for super::ScreenCapture {
         let (sender, receiver) = oneshot::channel();
         self.job_sender
             .send(ScreenJob::Display(Job::CaptureStart(sender)))
-            .await?;
-        tracing::info!("Starting capture requested");
-        let received = receiver.await??;
+            .await
+            .context("Failed to send capture start job to display handler")?;
+
+        tracing::info!("updates(): CaptureStart job sent, waiting for response");
+        let received = receiver
+            .await
+            .context("Failed to receive response from display capture")?
+            .context("Display capture initialization failed")?;
 
         Ok(Box::new(received))
     }
