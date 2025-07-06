@@ -37,6 +37,7 @@ pub(super) struct DisplayUpdates {
     index: ScreenOutputIndex,
     display_sender: mpsc::Sender<ScreenJob>,
     capture_receiver: triple_buffer::Output<CapturedData>,
+    #[allow(dead_code)]
     display_size: watch::Receiver<ScreenSize>,
     update_notification: Arc<Notify>,
     send_counter: IntervalCounter,
@@ -76,8 +77,8 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
         Some(DisplayUpdate::Bitmap(BitmapUpdate {
             x: *x,
             y: *y,
-            width: unsafe { NonZeroU16::new_unchecked(*width as u16) },
-            height: unsafe { NonZeroU16::new_unchecked(*height as u16) },
+            width: unsafe { NonZeroU16::new_unchecked(*width) },
+            height: unsafe { NonZeroU16::new_unchecked(*height) },
             format: ironrdp::server::PixelFormat::BgrA32,
             data: Bytes::from_static(unsafe { &*(buffer.as_slice() as *const [u8]) }),
             stride: (4 * width) as usize,
@@ -97,10 +98,7 @@ impl RdpServerDisplay for super::ScreenCapture {
             .await
             .unwrap_or_else(|e| panic!("Failed to get display size - {e:?}"));
         tracing::info!("init size: {width} x {height}");
-        DesktopSize {
-            width: width as u16,
-            height: height as u16,
-        }
+        DesktopSize { width, height }
     }
 
     async fn updates(&mut self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
@@ -213,7 +211,7 @@ impl SCStreamOutputTrait for DisplayCaptureDelegate {
             return;
         };
 
-        if let Some(pixel_buffer) = sample_buffer.get_pixel_buffer().ok() {
+        if let Ok(pixel_buffer) = sample_buffer.get_pixel_buffer() {
             let (mut x, mut y, max_x, max_y) =
                 dirty_rects
                     .iter()

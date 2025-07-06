@@ -159,12 +159,12 @@ impl ScreenCapture {
 impl ScreenCaptureContext {
     fn shutdown(&mut self) {
         tracing::info!("Shutting down ScreenCaptureContext");
-        
+
         // Clear RDP event sender to prevent further audio processing
         if let Ok(mut sender) = self.rdp_event_sender.write() {
             *sender = None;
         }
-        
+
         if let Err(e) = self.stream.stop_capture() {
             tracing::error!("Failed to stop capture stream: {:?}", e);
         }

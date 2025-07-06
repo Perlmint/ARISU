@@ -42,6 +42,7 @@ impl ServerEventSender for ScreenCapture {
 #[derive(Debug)]
 struct SoundServer {
     job_sender: mpsc::Sender<ScreenJob>,
+    #[allow(dead_code)]
     rdp_event_sender: Arc<RwLock<Option<mpsc::UnboundedSender<ServerEvent>>>>,
 }
 
