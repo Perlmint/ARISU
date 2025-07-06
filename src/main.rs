@@ -1,13 +1,6 @@
-use std::{net::IpAddr, path::PathBuf, str::FromStr};
-
-use anyhow::Context as _;
-use clap::Parser;
 // use clipboard::StubCliprdrServerFactory;
 use counter::IntervalCounter;
-use ironrdp::server::{Credentials, RdpServer, TlsIdentityCtx};
-use screen::ScreenCapture;
 use strum::EnumString;
-use tracing::error;
 
 mod config;
 mod counter;
@@ -16,6 +9,7 @@ mod counter;
 mod gui;
 mod input;
 mod screen;
+mod server;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
 #[strum(ascii_case_insensitive)]
@@ -25,125 +19,53 @@ enum Security {
     Hybrid,
 }
 
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    /// Name of the person to greet
-    #[arg(long, default_value = "0.0.0.0")]
-    host: String,
-    #[arg(long, default_value_t = 3389)]
-    port: u16,
-    #[arg(long)]
-    certificate: Option<PathBuf>,
-    #[arg(long)]
-    key: Option<PathBuf>,
-    #[arg(long, default_value = "none")]
-    security: Security,
-}
-
 fn main() -> Result<(), anyhow::Error> {
-    let args = Args::parse();
-
     let capture_counter = IntervalCounter::new();
     let display_send_counter = IntervalCounter::new();
 
     let capture_counter_interval = capture_counter.interval();
     let display_send_counter_interval = display_send_counter.interval();
 
-    use tracing_subscriber::{filter::LevelFilter, fmt, EnvFilter};
-    fmt()
-        .with_max_level(LevelFilter::INFO)
-        .with_env_filter(EnvFilter::from_default_env())
+    use std::fs::OpenOptions;
+    use tracing_oslog::OsLogger;
+    use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*, EnvFilter};
+
+    // Create log file
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/arisu.log")
+        .expect("Failed to create log file");
+
+    let (non_blocking_file, _guard) = tracing_appender::non_blocking(log_file);
+
+    // Create a layered subscriber that sends error/warn to Console, all logs to stdout, and all logs to file
+    tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()))
+        .with(
+            OsLogger::new("app.perlmint.arisu", "default").with_filter(LevelFilter::WARN), // Only send warn/error to Console
+        )
+        .with(
+            fmt::layer().with_filter(LevelFilter::INFO), // Send info and above to stdout
+        )
+        .with(
+            fmt::layer()
+                .with_writer(non_blocking_file)
+                .with_filter(LevelFilter::DEBUG), // Send debug and above to file
+        )
         .init();
 
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build tokio runtime");
-        rt.block_on(async move {
-            let top_local_set = tokio::task::LocalSet::new();
+    // Keep the guard alive to prevent dropping the log writer
+    std::mem::forget(_guard);
 
-            let mut join_set = tokio::task::JoinSet::new();
-            let _server_handle = join_set.spawn_local_on(
-                async move {
-                    let local_set = tokio::task::LocalSet::new();
-                    let security = args.security;
+    // Create server controller
+    let server_controller = server::ServerController::new(capture_counter, display_send_counter)?;
 
-                    tracing::info!("Building RDP server");
-                    let server_builder =
-                        RdpServer::builder().with_addr((IpAddr::from_str(&args.host)?, args.port));
-
-                    let server_builder =
-                        if let Some((cert_path, key_path)) = args.certificate.zip(args.key) {
-                            let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path)
-                                .context("failed to init TLS identity")?;
-                            let acceptor = identity
-                                .make_acceptor()
-                                .context("failed to build TLS acceptor")?;
-
-                            if security == Security::Hybrid {
-                                server_builder.with_hybrid(acceptor, identity.pub_key)
-                            } else {
-                                server_builder.with_tls(acceptor)
-                            }
-                        } else if security == Security::None {
-                            server_builder.with_no_security()
-                        } else {
-                            anyhow::bail!("Security is specified. but cert is not specified");
-                        };
-
-                    tracing::info!("Create clipboard server");
-                    // let cliprdr = Box::new(StubCliprdrServerFactory::new());
-
-                    tracing::info!("Create display handler");
-                    let (screen_handler, screen_job_processor) =
-                        ScreenCapture::new(&local_set, capture_counter, display_send_counter)?;
-
-                    let mut server = server_builder
-                        .with_input_handler(screen_handler.input_handler())
-                        .with_display_handler(screen_handler.clone())
-                        // .with_cliprdr_factory(Some(cliprdr))
-                        // .with_sound_factory(Some(Box::new(screen_handler)))
-                        .build();
-
-                    server.set_credentials(Some(Credentials {
-                        username: "user".to_string(),
-                        password: "user".to_string(),
-                        domain: None,
-                    }));
-
-                    let server_join_handler = local_set.spawn_local(async move {
-                        tracing::info!("Starting server");
-                        if let Err(e) = server.run().await {
-                            tracing::error!(?e, "Server run error");
-                        }
-                    });
-
-                    local_set.await;
-                    server_join_handler.await.context("server error")?;
-                    screen_job_processor
-                        .await
-                        .context("display job join error")
-                        .and_then(|i| i.context("diaply job error"))?;
-
-                    Ok(())
-                },
-                &top_local_set,
-            );
-            join_set.spawn(async move { Result::<(), anyhow::Error>::Ok(()) });
-
-            tracing::info!("Start server");
-            let (_, join_ret) = tokio::join!(top_local_set, join_set.join_all(),);
-            for ret in join_ret {
-                if let Err(e) = ret {
-                    error!(?e);
-                }
-            }
-        });
-    });
-
-    gui::run(capture_counter_interval, display_send_counter_interval);
+    gui::run(
+        capture_counter_interval,
+        display_send_counter_interval,
+        server_controller,
+    );
 
     Ok(())
 }

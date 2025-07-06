@@ -36,6 +36,7 @@ impl ScreenOutputIndex {
 enum ScreenJob {
     Display(display::Job),
     Sound(sound::Job),
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +122,11 @@ impl ScreenCapture {
                 match job {
                     ScreenJob::Display(job) => context.handle_display_job(job),
                     ScreenJob::Sound(job) => context.handle_sound_job(job),
+                    ScreenJob::Shutdown => {
+                        tracing::info!("Received shutdown signal, stopping ScreenCapture");
+                        context.shutdown();
+                        break;
+                    }
                 }
             }
 
@@ -141,5 +147,26 @@ impl ScreenCapture {
 
     pub fn input_handler(&self) -> InputHandler {
         InputHandler::new(self.screen_size.clone())
+    }
+
+    pub async fn shutdown(&self) {
+        if let Err(e) = self.job_sender.send(ScreenJob::Shutdown).await {
+            tracing::error!("Failed to send shutdown signal to ScreenCapture: {}", e);
+        }
+    }
+}
+
+impl ScreenCaptureContext {
+    fn shutdown(&mut self) {
+        tracing::info!("Shutting down ScreenCaptureContext");
+        
+        // Clear RDP event sender to prevent further audio processing
+        if let Ok(mut sender) = self.rdp_event_sender.write() {
+            *sender = None;
+        }
+        
+        if let Err(e) = self.stream.stop_capture() {
+            tracing::error!("Failed to stop capture stream: {:?}", e);
+        }
     }
 }

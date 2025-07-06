@@ -1,7 +1,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 use std::cell::RefCell;
 
-use crate::{config::Config, counter::Interval};
+use crate::{
+    config::Config,
+    counter::Interval,
+    server::{ServerController, ServerStatus},
+};
 
 mod settings;
 use objc2::rc::Retained;
@@ -25,6 +29,7 @@ struct UiElements {
     menu: Retained<NSMenu>, // Kept alive for proper cleanup
     capture_fps_item: Retained<NSMenuItem>,
     send_fps_item: Retained<NSMenuItem>,
+    start_stop_item: Retained<NSMenuItem>,
     #[allow(dead_code)]
     settings_item: Retained<NSMenuItem>,
 }
@@ -34,6 +39,7 @@ struct Ivars {
     display_send_interval: Interval,
     ui: RefCell<Option<UiElements>>,
     config: RefCell<Option<Config>>,
+    server_controller: ServerController,
 }
 
 define_class!(
@@ -80,6 +86,11 @@ define_class!(
         fn open_settings(&self) {
             self.show_settings_dialog();
         }
+
+        #[unsafe(method(toggleServer))]
+        fn toggle_server(&self) {
+            self.toggle_server_state();
+        }
     }
 );
 
@@ -87,6 +98,7 @@ impl AppDelegate {
     fn new(
         capture_interval: Interval,
         display_send_interval: Interval,
+        server_controller: ServerController,
         mtm: MainThreadMarker,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm);
@@ -95,6 +107,7 @@ impl AppDelegate {
             display_send_interval,
             ui: RefCell::new(None),
             config: RefCell::new(None),
+            server_controller,
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -142,6 +155,18 @@ impl AppDelegate {
             let separator = NSMenuItem::separatorItem(mtm);
             menu.addItem(&separator);
 
+            // Add start/stop server item
+            let start_stop_item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("Start"),
+                    Some(sel!(toggleServer)),
+                    &NSString::from_str("s"),
+                )
+            };
+            unsafe { start_stop_item.setTarget(Some(self)) };
+            menu.addItem(&start_stop_item);
+
             // Add settings item
             let settings_item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -184,6 +209,7 @@ impl AppDelegate {
                 menu,
                 capture_fps_item,
                 send_fps_item,
+                start_stop_item,
                 settings_item,
             }));
 
@@ -210,13 +236,36 @@ impl AppDelegate {
         let send_interval = self.ivars().display_send_interval.get();
         let send_fps = 1.0 / send_interval.as_secs_f64();
 
+        // Update server status
+        let server_status = self.ivars().server_controller.get_status_sync();
+        let (status_text, enabled) = match server_status {
+            ServerStatus::Stopped => ("Start", true),
+            ServerStatus::Starting => ("Starting...", false),
+            ServerStatus::Running => ("Stop", true),
+            ServerStatus::Stopping => ("Stopping...", false),
+            ServerStatus::Error => ("Start (Error)", true),
+        };
+
+        // Only show FPS when server is running
+        let show_fps = server_status == ServerStatus::Running;
+
         unsafe {
-            ui.capture_fps_item.setTitle(&NSString::from_str(&format!(
-                "Capture FPS: {:.2}",
-                capture_fps
-            )));
-            ui.send_fps_item
-                .setTitle(&NSString::from_str(&format!("Send FPS: {:.2}", send_fps)));
+            if show_fps {
+                ui.capture_fps_item.setTitle(&NSString::from_str(&format!(
+                    "Capture FPS: {:.2}",
+                    capture_fps
+                )));
+                ui.send_fps_item
+                    .setTitle(&NSString::from_str(&format!("Send FPS: {:.2}", send_fps)));
+            } else {
+                ui.capture_fps_item
+                    .setTitle(&NSString::from_str("Capture FPS: --"));
+                ui.send_fps_item
+                    .setTitle(&NSString::from_str("Send FPS: --"));
+            }
+            ui.start_stop_item
+                .setTitle(&NSString::from_str(status_text));
+            ui.start_stop_item.setEnabled(enabled);
         };
     }
 
@@ -231,16 +280,50 @@ impl AppDelegate {
             self.ivars().config.replace(Some(new_config));
         }
     }
+
+    fn toggle_server_state(&self) {
+        let server_status = self.ivars().server_controller.get_status_sync();
+        let config = self.ivars().config.borrow();
+
+        match server_status {
+            ServerStatus::Stopped | ServerStatus::Error => {
+                if let Some(config) = config.as_ref() {
+                    if let Err(e) = self.ivars().server_controller.start_server(config.clone()) {
+                        error!("Failed to start server: {}", e);
+                    }
+                } else {
+                    error!("No configuration available. Please configure settings first.");
+                }
+            }
+            ServerStatus::Running => {
+                if let Err(e) = self.ivars().server_controller.stop_server() {
+                    error!("Failed to stop server: {}", e);
+                }
+            }
+            ServerStatus::Starting | ServerStatus::Stopping => {
+                // Do nothing while transitioning
+            }
+        }
+    }
 }
 
-pub fn run(capture_interval: Interval, display_send_interval: Interval) {
+pub fn run(
+    capture_interval: Interval,
+    display_send_interval: Interval,
+    server_controller: ServerController,
+) {
     let mtm: MainThreadMarker = MainThreadMarker::new().unwrap();
 
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     // configure the application delegate
-    let delegate = AppDelegate::new(capture_interval, display_send_interval, mtm);
+    let delegate = AppDelegate::new(
+        capture_interval,
+        display_send_interval,
+        server_controller,
+        mtm,
+    );
     let object = ProtocolObject::from_ref(&*delegate);
     app.setDelegate(Some(object));
 
