@@ -17,6 +17,8 @@ use crate::{counter::IntervalCounter, screen::ScreenJob};
 
 use super::{ScreenOutputIndex, ScreenSize};
 
+const BYTES_PER_PIXEL: usize = 4; // BGRA format
+
 pub(super) enum Job {
     GetSize(oneshot::Sender<(u16, u16)>),
     SetSize(u16, u16),
@@ -81,7 +83,7 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
             height: unsafe { NonZeroU16::new_unchecked(*height) },
             format: ironrdp::server::PixelFormat::BgrA32,
             data: Bytes::from_static(unsafe { &*(buffer.as_slice() as *const [u8]) }),
-            stride: (4 * width) as usize,
+            stride: BYTES_PER_PIXEL * (*width as usize),
         }))
     }
 }
@@ -154,7 +156,7 @@ fn convert_buffer(
             input.get_bytes_per_row_of_plane(0),
         )
     };
-    let data_size = width * height * 4; // 4 bytes per pixel (BGRA)
+    let data_size = width * height * BYTES_PER_PIXEL;
     if output.data.len() < data_size {
         let reserve_size = data_size - output.data.len();
         tracing::trace!("reserve: {reserve_size}");
@@ -165,10 +167,13 @@ fn convert_buffer(
     }
     let out_addr = output.data.as_mut_ptr();
     for rect_y in 0..height {
-        let src_addr = unsafe { base_address.add((y + rect_y) * (bytes_per_row as usize) + x * 4) };
-        let out_addr = unsafe { out_addr.add(rect_y * width * 4 + x * 4) };
+        let src_addr = unsafe {
+            base_address.add((y + rect_y) * (bytes_per_row as usize) + x * BYTES_PER_PIXEL)
+        };
+        let out_addr =
+            unsafe { out_addr.add(rect_y * width * BYTES_PER_PIXEL + x * BYTES_PER_PIXEL) };
         unsafe {
-            std::ptr::copy_nonoverlapping(src_addr, out_addr, width * 4);
+            std::ptr::copy_nonoverlapping(src_addr, out_addr, width * BYTES_PER_PIXEL);
         }
     }
 
@@ -285,11 +290,12 @@ impl super::ScreenCaptureContext {
             }
             Job::CaptureStart(sender) => {
                 let screen_size = *self.display_size.borrow();
+                let buffer_size = BYTES_PER_PIXEL
+                    * (screen_size.server.0 as usize)
+                    * (screen_size.server.1 as usize);
                 let (capture_sender, capture_receiver) =
                     triple_buffer::triple_buffer(&CapturedData {
-                        data: Vec::with_capacity(
-                            (4 * screen_size.server.0 * screen_size.server.1) as usize,
-                        ),
+                        data: Vec::with_capacity(buffer_size),
                         width: screen_size.server.0 as _,
                         height: screen_size.server.1 as _,
                         x: 0,
