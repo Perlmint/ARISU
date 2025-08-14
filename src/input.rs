@@ -56,7 +56,7 @@ impl InputHandler {
     fn convert_keyboard_event(
         &mut self,
         event: KeyboardEvent,
-    ) -> anyhow::Result<CFRetained<CGEvent>> {
+    ) -> anyhow::Result<Option<CFRetained<CGEvent>>> {
         fn convert_non_unicode_key(
             code: u8,
             extended: bool,
@@ -175,14 +175,14 @@ impl InputHandler {
                 let code = convert_non_unicode_key(code, extended, true, &mut self.modifier_state)
                     .with_context(|| format!("Unknown code - {code}, {extended}"))?;
                 unsafe { CGEvent::new_keyboard_event(None, code, true) }
-                    .map(|event| self.apply_modifier_to_event(event))
+                    .map(|event| Some(self.apply_modifier_to_event(event)))
+                    .ok_or_else(|| anyhow::anyhow!("Failed to convert keyboard pressed event"))
             }
-            .ok_or_else(|| anyhow::anyhow!("Failed to convert keyboard pressed event")),
             KeyboardEvent::Released { code, extended } => {
                 let code = convert_non_unicode_key(code, extended, false, &mut self.modifier_state)
                     .with_context(|| format!("Unknown code - {code}, {extended}"))?;
                 (unsafe { CGEvent::new_keyboard_event(None, code, false) })
-                    .map(|event| self.apply_modifier_to_event(event))
+                    .map(|event| Some(self.apply_modifier_to_event(event)))
                     .ok_or_else(|| anyhow::anyhow!("Failed to convert keyboard pressed event"))
             }
             KeyboardEvent::UnicodePressed(code) => {
@@ -191,7 +191,7 @@ impl InputHandler {
                         anyhow::anyhow!("Failed to convert keyboard event - {event:?}")
                     })?;
                 unsafe { CGEvent::keyboard_set_unicode_string(Some(event.as_ref()), 1, &code) };
-                Ok(event)
+                Ok(Some(event))
             }
             KeyboardEvent::UnicodeReleased(code) => {
                 let event =
@@ -199,16 +199,16 @@ impl InputHandler {
                         anyhow::anyhow!("Failed to convert keyboard event - {event:?}")
                     })?;
                 unsafe { CGEvent::keyboard_set_unicode_string(Some(event.as_ref()), 1, &code) };
-                Ok(event)
+                Ok(Some(event))
             }
-            _ => Err(anyhow::anyhow!("Unhandled event - {event:?}")),
+            KeyboardEvent::Synchronize(_state) => Ok(None),
         }
     }
 }
 
 impl RdpServerInputHandler for InputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
-        let Ok(event) = self
+        let Ok(Some(event)) = self
             .convert_keyboard_event(event)
             .map_err(|e| tracing::error!(?e))
         else {

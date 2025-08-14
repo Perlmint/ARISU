@@ -212,7 +212,7 @@ async fn run_server(
 
     info!("run_server: Creating display handler");
     let (screen_handler, screen_job_processor) =
-        match ScreenCapture::new(&local_set, capture_counter, display_send_counter) {
+        match ScreenCapture::new(&local_set, capture_counter, display_send_counter).await {
             Ok(result) => {
                 info!("run_server: ScreenCapture created successfully");
                 result
@@ -227,6 +227,8 @@ async fn run_server(
     let mut server = server_builder
         .with_input_handler(screen_handler.input_handler())
         .with_display_handler(screen_handler.clone())
+        // .with_cliprdr_factory(Some(Box::new(ClipboardServerFactory::new())))
+        .with_sound_factory(Some(Box::new(screen_handler.clone())))
         .build();
 
     info!("run_server: Setting credentials");

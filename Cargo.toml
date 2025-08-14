@@ -7,14 +7,13 @@ edition = "2021"
 default = []
 
 [dependencies]
-anyhow = "1.0.94"
-async-trait = "0.1.83"
-clap = { version = "4.5.23", features = ["derive"] }
+anyhow = "1.0.99"
+async-trait = "0.1.89"
+clap = { version = "4.5.45", features = ["derive"] }
 ironrdp = { version = "0.10.0", features = ["cliprdr", "rdpsnd", "server", "connector", "displaycontrol"] }
 # ironrdp-cliprdr-native = { version = "0.1.0" }
-screencapturekit = "0.3.5"
-core-graphics-types = "*"
-strum = { version = "0.26.3", features = ["derive"] }
+objc2-screen-capture-kit = "*"
+strum = { version = "0.27.2", features = ["derive"] }
 tokio = { version = "*", features = ["macros"] }
 objc = "*"
 tracing = "0.1.41"
@@ -22,19 +21,25 @@ tracing-subscriber = { version = "*", features = ["env-filter"] }
 tracing-oslog = "0.3.0"
 tracing-appender = "0.2"
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
+toml = "0.9"
 dirs = "6.0.0"
 
 ratatui = { version = "0.29", optional = true }
 
+block2 = "0.6.1"
+bytes = "1.10.1"
+cfg-if = "1.0.3"
+dispatch2 = "0.3.0"
+objc2 = "0.6.2"
+objc2-app-kit = "*"
+objc2-avf-audio = "0.3.1"
+objc2-core-audio = "0.3.1"
 objc2-core-foundation = "*"
 objc2-core-graphics = "*"
-objc2-app-kit = "*"
+objc2-core-media = "*"
+objc2-core-video = "*"
 objc2-foundation = "*"
-cfg-if = "1.0.0"
 triple_buffer = "8.1.1"
-bytes = "1.10.1"
-objc2 = "0.6.1"
 
 [patch.crates-io]
 # ironrdp = { path = "../IronRDP/crates/ironrdp" }

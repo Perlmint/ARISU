@@ -1,4 +1,3 @@
-// use clipboard::StubCliprdrServerFactory;
 use counter::IntervalCounter;
 use strum::EnumString;
 
@@ -51,7 +50,7 @@ fn main() -> Result<(), anyhow::Error> {
         .with(
             fmt::layer()
                 .with_writer(non_blocking_file)
-                .with_filter(LevelFilter::DEBUG), // Send debug and above to file
+                .with_filter(LevelFilter::TRACE), // Send debug and above to file
         )
         .init();
 

@@ -1,29 +1,70 @@
-use anyhow::Context as _;
+use anyhow::{anyhow, Context as _};
 use bytes::Bytes;
+use dispatch2::DispatchQueue;
 use ironrdp::server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates,
 };
-use screencapturekit::{
-    output::{
-        sc_stream_frame_info::{SCFrameStatus, SCStreamFrameInfo},
-        CVPixelBuffer, LockTrait,
-    },
-    stream::{output_trait::SCStreamOutputTrait, output_type::SCStreamOutputType},
+use objc2::{
+    define_class, msg_send, rc::Retained, runtime::ProtocolObject, AnyThread as _,
+    DefinedClass as _,
 };
-use std::{cell::RefCell, num::NonZeroU16, sync::Arc};
+use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
+use objc2_core_media::CMSampleBuffer;
+use objc2_core_video::{
+    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
+    CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight,
+    CVPixelBufferGetPlaneCount, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
+    CVPixelBufferLockFlags,
+};
+use objc2_foundation::{NSObject, NSObjectProtocol};
+use objc2_screen_capture_kit::{
+    SCFrameStatus, SCStream, SCStreamFrameInfoDirtyRects, SCStreamFrameInfoStatus, SCStreamOutput,
+    SCStreamOutputType,
+};
+use std::{
+    cell::RefCell,
+    mem::transmute,
+    num::NonZeroU16,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 
 use crate::{counter::IntervalCounter, screen::ScreenJob};
 
-use super::{ScreenOutputIndex, ScreenSize};
+use super::ScreenSize;
 
 const BYTES_PER_PIXEL: usize = 4; // BGRA format
+
+fn dict_to_rect(
+    rect: &CFDictionary<CFString, CFNumber>,
+) -> anyhow::Result<(usize, usize, usize, usize)> {
+    let x = unsafe { rect.get_unchecked(&CFString::from_static_str("X")) }
+        .ok_or(anyhow!("X is not found"))?
+        .as_f64()
+        .ok_or(anyhow!("Failed to convert X to f64"))? as usize;
+    let y = unsafe { rect.get_unchecked(&CFString::from_static_str("Y")) }
+        .ok_or(anyhow!("Y is not found"))?
+        .as_f64()
+        .ok_or(anyhow!("Failed to convert Y to f64"))? as usize;
+    let width = unsafe { rect.get_unchecked(&CFString::from_static_str("Width")) }
+        .ok_or(anyhow!("Width is not found"))?
+        .as_f64()
+        .ok_or(anyhow!("Failed to convert Width to f64"))? as usize;
+    let height = unsafe { rect.get_unchecked(&CFString::from_static_str("Height")) }
+        .ok_or(anyhow!("Height is not found"))?
+        .as_f64()
+        .ok_or(anyhow!("Failed to convert Height to f64"))? as usize;
+    Ok((x, y, width, height))
+}
 
 pub(super) enum Job {
     GetSize(oneshot::Sender<(u16, u16)>),
     SetSize(u16, u16),
     CaptureStart(oneshot::Sender<anyhow::Result<DisplayUpdates>>),
-    CaptureStop(ScreenOutputIndex),
+    CaptureStop,
 }
 
 #[derive(Debug, Clone)]
@@ -32,11 +73,11 @@ struct CapturedData {
     y: u16,
     width: u16,
     height: u16,
+    stride: usize,
     data: Vec<u8>,
 }
 
 pub(super) struct DisplayUpdates {
-    index: ScreenOutputIndex,
     display_sender: mpsc::Sender<ScreenJob>,
     capture_receiver: triple_buffer::Output<CapturedData>,
     #[allow(dead_code)]
@@ -49,7 +90,7 @@ impl Drop for DisplayUpdates {
     fn drop(&mut self) {
         let _ = self
             .display_sender
-            .try_send(ScreenJob::Display(Job::CaptureStop(self.index)));
+            .try_send(ScreenJob::Display(Job::CaptureStop));
     }
 }
 
@@ -63,27 +104,32 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
             y,
             width,
             height,
+            stride,
             data: buffer,
         } = self.capture_receiver.peek_output_buffer();
-        tracing::trace!(
-            "Received display update: ({x}, {y}) {width} x {height}, buffer size: {}, {}, {:?}",
-            buffer.len(),
-            if buffer.iter().all(|&b| b == 0) {
-                "black"
-            } else {
-                "data"
-            },
-            buffer.as_ptr()
-        );
         self.send_counter.update();
+        let start_offset = *y as usize * *stride + *x as usize * BYTES_PER_PIXEL;
+        let end_offset =
+            start_offset + (*height as usize - 1) * *stride + *width as usize * BYTES_PER_PIXEL;
+        tracing::info!(
+            "x: {}, y: {}, width: {}, height: {}, start_offset: {}, end_offset: {}",
+            *x,
+            *y,
+            *width,
+            *height,
+            start_offset,
+            end_offset
+        );
         Some(DisplayUpdate::Bitmap(BitmapUpdate {
             x: *x,
             y: *y,
             width: unsafe { NonZeroU16::new_unchecked(*width) },
             height: unsafe { NonZeroU16::new_unchecked(*height) },
             format: ironrdp::server::PixelFormat::BgrA32,
-            data: Bytes::from_static(unsafe { &*(buffer.as_slice() as *const [u8]) }),
-            stride: BYTES_PER_PIXEL * (*width as usize),
+            data: Bytes::from_static(unsafe {
+                &*(&buffer[start_offset..end_offset] as *const [u8])
+            }),
+            stride: *stride,
         }))
     }
 }
@@ -99,7 +145,7 @@ impl RdpServerDisplay for super::ScreenCapture {
         let (width, height) = receiver
             .await
             .unwrap_or_else(|e| panic!("Failed to get display size - {e:?}"));
-        tracing::info!("init size: {width} x {height}");
+        tracing::info!("display size: {width} x {height}");
         DesktopSize { width, height }
     }
 
@@ -146,118 +192,203 @@ fn convert_buffer(
     input: &CVPixelBuffer,
     output: &mut CapturedData,
 ) -> bool {
-    let plane_count = input.get_plane_count();
-    let Ok(locked) = input
-        .lock()
-        .map_err(|e| tracing::error!("Failed to lock buffer - {e:?}"))
-    else {
+    let plane_count = unsafe { CVPixelBufferGetPlaneCount(input) };
+    let lock_result =
+        unsafe { CVPixelBufferLockBaseAddress(input, CVPixelBufferLockFlags::ReadOnly) };
+    if lock_result != 0 {
+        tracing::error!("Failed to lock pixel buffer base address - {lock_result}");
         return false;
     };
+
     let (base_address, bytes_per_row) = if plane_count == 0 {
-        (locked.as_slice().as_ptr(), input.get_bytes_per_row())
-    } else {
-        (
-            locked.as_slice_plane(0).as_ptr(),
-            input.get_bytes_per_row_of_plane(0),
-        )
-    };
-    let data_size = width * height * BYTES_PER_PIXEL;
-    if output.data.len() < data_size {
-        let reserve_size = data_size - output.data.len();
-        tracing::trace!("reserve: {reserve_size}");
-        output.data.reserve(reserve_size);
-    }
-    unsafe {
-        output.data.set_len(data_size);
-    }
-    let out_addr = output.data.as_mut_ptr();
-    for rect_y in 0..height {
-        let src_addr = unsafe {
-            base_address.add((y + rect_y) * (bytes_per_row as usize) + x * BYTES_PER_PIXEL)
-        };
-        let out_addr =
-            unsafe { out_addr.add(rect_y * width * BYTES_PER_PIXEL + x * BYTES_PER_PIXEL) };
         unsafe {
-            std::ptr::copy_nonoverlapping(src_addr, out_addr, width * BYTES_PER_PIXEL);
+            (
+                CVPixelBufferGetBaseAddress(input),
+                CVPixelBufferGetBytesPerRow(input),
+            )
         }
+    } else {
+        unsafe {
+            (
+                CVPixelBufferGetBaseAddressOfPlane(input, 0),
+                CVPixelBufferGetBytesPerRowOfPlane(input, 0),
+            )
+        }
+    };
+    let base_address = base_address as *const u8;
+    let data_size = (height - 1) * bytes_per_row + width * BYTES_PER_PIXEL;
+    let out_addr = unsafe {
+        output
+            .data
+            .as_mut_ptr()
+            .add(y * (bytes_per_row) + x * BYTES_PER_PIXEL)
+    };
+    let src_addr = unsafe { base_address.add(y * (bytes_per_row) + x * BYTES_PER_PIXEL) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(src_addr, out_addr, data_size);
     }
 
     output.x = x as _;
     output.y = y as _;
     output.width = width as _;
     output.height = height as _;
+    output.stride = bytes_per_row;
 
     true
 }
 
-struct DisplayCaptureDelegate {
+struct DisplayCaptureDelegateIvars {
     sender: RefCell<triple_buffer::Input<CapturedData>>,
     update_notifier: Arc<Notify>,
     capture_counter: RefCell<IntervalCounter>,
+    is_first_submission: AtomicBool,
 }
 
-impl SCStreamOutputTrait for DisplayCaptureDelegate {
-    fn did_output_sample_buffer(
-        &self,
-        sample_buffer: screencapturekit::output::CMSampleBuffer,
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[ivars = DisplayCaptureDelegateIvars]
+    struct DisplayCaptureDelegate;
+
+    unsafe impl NSObjectProtocol for DisplayCaptureDelegate {}
+
+    unsafe impl SCStreamOutput for DisplayCaptureDelegate {
+        #[allow(non_snake_case)]
+        #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
+        unsafe fn stream_didOutputSampleBuffer_ofType(
+            &self,
+            _stream: &SCStream,
+            sample_buffer: &CMSampleBuffer,
+            of_type: SCStreamOutputType,
+        ) {
+            if let Err(e) = Self::handle_stream(self.ivars(), _stream, sample_buffer, of_type) {
+                tracing::error!("Error in handle_stream: {e:?}");
+            }
+        }
+    }
+);
+
+impl DisplayCaptureDelegate {
+    pub(crate) fn new(
+        sender: triple_buffer::Input<CapturedData>,
+        update_notifier: Arc<Notify>,
+        capture_counter: IntervalCounter,
+    ) -> Retained<Self> {
+        let this = DisplayCaptureDelegate::alloc();
+        let this = this.set_ivars(DisplayCaptureDelegateIvars {
+            sender: RefCell::new(sender),
+            update_notifier,
+            capture_counter: RefCell::new(capture_counter),
+            is_first_submission: AtomicBool::new(true),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn handle_stream(
+        ivars: &DisplayCaptureDelegateIvars,
+        _stream: &SCStream,
+        sample_buffer: &CMSampleBuffer,
         of_type: SCStreamOutputType,
-    ) {
+    ) -> anyhow::Result<()> {
         if of_type != SCStreamOutputType::Screen {
-            tracing::error!("non-screen received");
-            return;
+            return Err(anyhow!("non-screen received"));
         }
 
-        let Ok(frame_info) = SCStreamFrameInfo::from_sample_buffer(&sample_buffer).map_err(|e| {
-            tracing::error!("Failed to get frame info from sample buffer: {e:?}");
-        }) else {
-            return;
+        let Some(attachments) = (unsafe { sample_buffer.sample_attachments_array(false) }) else {
+            return Err(anyhow!("No attachments found in sample buffer"));
         };
-        if frame_info.status() != SCFrameStatus::Complete {
+        let attachments = unsafe { CFRetained::cast_unchecked::<CFArray<CFType>>(attachments) };
+        let Some(attachments) = attachments.get(0) else {
+            return Err(anyhow!("No attachments found in sample buffer"));
+        };
+        let Ok(attachments) = attachments.downcast::<CFDictionary>() else {
+            return Err(anyhow!("Failed to downcast sample buffer attachments"));
+        };
+        let attachments =
+            unsafe { CFRetained::cast_unchecked::<CFDictionary<CFString, CFType>>(attachments) };
+        let Some(status) = attachments.get(unsafe { transmute(SCStreamFrameInfoStatus) }) else {
+            return Err(anyhow!(
+                "Failed to get frame info status from sample buffer"
+            ));
+        };
+        let status = status.downcast::<CFNumber>();
+        let Ok(status) = status else {
+            return Err(anyhow!("Failed to downcast frame info status"));
+        };
+        let Some(status) = status.as_i64() else {
+            return Err(anyhow!("Failed to convert frame info status to i64"));
+        };
+        let status = SCFrameStatus(status as _);
+        if status != SCFrameStatus::Complete {
             tracing::trace!("not completed");
-            return;
+            return Ok(());
         }
-        let Some(dirty_rects) = frame_info.dirty_rects() else {
-            tracing::error!("Failed to get dirty rects from frame info");
-            return;
+
+        let Some(dirty_rects) = attachments.get(unsafe { transmute(SCStreamFrameInfoDirtyRects) })
+        else {
+            return Err(anyhow!(
+                "Failed to get frame info dirty rects from sample buffer"
+            ));
         };
+        let Ok(dirty_rects) = dirty_rects.downcast::<CFArray>() else {
+            return Err(anyhow!("Failed to downcast dirty rects"));
+        };
+        let dirty_rects = unsafe { CFRetained::cast_unchecked::<CFArray<CFType>>(dirty_rects) };
 
-        if let Ok(pixel_buffer) = sample_buffer.get_pixel_buffer() {
-            let (mut x, mut y, max_x, max_y) =
-                dirty_rects
-                    .iter()
-                    .fold((0, 0, 0, 0), |(min_x, min_y, max_x, max_y), rect| {
-                        let x = rect.origin.x as usize;
-                        let y = rect.origin.y as usize;
-                        let width = rect.size.width as usize;
-                        let height = rect.size.height as usize;
+        let Some(pixel_buffer) = (unsafe { sample_buffer.image_buffer() }) else {
+            return Err(anyhow!("Failed to get image buffer from sample buffer"));
+        };
+        let pixel_buffer = pixel_buffer.as_ref();
+        let Ok((mut x, mut y, max_x, max_y)) = dirty_rects.iter().try_fold(
+            (usize::MAX, usize::MAX, 0, 0),
+            |(min_x, min_y, max_x, max_y), rect| {
+                let Ok(rect) = rect.downcast::<CFDictionary>() else {
+                    return Err(anyhow!("Failed to downcast dirty rect"));
+                };
+                let rect =
+                    unsafe { CFRetained::cast_unchecked::<CFDictionary<CFString, CFNumber>>(rect) };
+                let (x, y, width, height) =
+                    dict_to_rect(&rect).context("Failed to convert dirty rect to coordinates")?;
 
-                        (
-                            min_x.min(x),
-                            min_y.min(y),
-                            max_x.max(x + width),
-                            max_y.max(y + height),
-                        )
-                    });
-            let mut width = max_x - x;
-            let mut height = max_y - y;
-            if width == 0 || height == 0 {
+                Ok((
+                    min_x.min(x),
+                    min_y.min(y),
+                    max_x.max(x + width),
+                    max_y.max(y + height),
+                ))
+            },
+        ) else {
+            return Err(anyhow!("Failed to merge dirty rects"));
+        };
+        let mut width = max_x - x;
+        let mut height = max_y - y;
+        let is_first = ivars.is_first_submission.swap(false, Ordering::Relaxed);
+
+        if width == 0 || height == 0 {
+            if is_first {
                 x = 0;
                 y = 0;
-                width = pixel_buffer.get_width() as usize;
-                height = pixel_buffer.get_height() as usize;
+                width = unsafe { CVPixelBufferGetWidth(pixel_buffer) } as usize;
+                height = unsafe { CVPixelBufferGetHeight(pixel_buffer) } as usize;
+                tracing::info!("First submission, sending full buffer: {width} x {height}");
+            } else {
+                tracing::trace!("No dirty rects found on non-first submission, skipping");
+                return Ok(());
             }
-            let mut input_buffer = self.sender.borrow_mut();
-            {
-                let input_buffer = input_buffer.input_buffer_mut();
-                if !convert_buffer(x, y, width, height, &pixel_buffer, input_buffer) {
-                    tracing::error!("Failed to convert buffer");
-                    return;
-                };
-            }
-            input_buffer.publish();
-            self.update_notifier.notify_waiters();
-            self.capture_counter.borrow_mut().update();
+        } else {
+            tracing::info!("Dirty rects found: x: {x}, y: {y}, width: {width}, height: {height}");
         }
+
+        let mut input_buffer = ivars.sender.borrow_mut();
+        {
+            let input_buffer = input_buffer.input_buffer_mut();
+            if !convert_buffer(x, y, width, height, &pixel_buffer, input_buffer) {
+                return Err(anyhow!("Failed to convert buffer"));
+            };
+        }
+        input_buffer.publish();
+        ivars.update_notifier.notify_waiters();
+        ivars.capture_counter.borrow_mut().update();
+        Ok(())
     }
 }
 
@@ -272,26 +403,34 @@ impl super::ScreenCaptureContext {
                 }
             }
             Job::SetSize(width, height) => {
-                // use objc2_core_graphics::{CGGetActiveDisplayList, CGDisplayCopyDisplayMode, CGDisplayMode, CGDirectDisplayID};
-                // let mut active_displays = std::mem::MaybeUninit::<[CGDirectDisplayID; 1]>::uninit();
-                // let mut display_count = std::mem::MaybeUninit::<u32>::uninit();
-                // unsafe { CGGetActiveDisplayList(1, &raw mut (&mut *active_displays.as_mut_ptr())[0], display_count.as_mut_ptr()) };
-                // let active_displays = unsafe { active_displays.assume_init() };
-                // let display_count = unsafe { display_count.assume_init() };
-                // if display_count == 0 {
-                //     panic!("No active displays found");
+                // unsafe {
+                //     self.capture_config.setWidth(width as _);
+                //     self.capture_config.setHeight(height as _);
                 // }
-                // let display = active_displays[0];
-                // let display_mode = unsafe { CGDisplayCopyDisplayMode(display) }.unwrap();
-                self.display_size.send_if_modified(|screen_size| {
-                    if screen_size.client != (width, height) {
-                        tracing::info!("Client display size changed: {} x {}", width, height);
-                        screen_size.client = (width, height);
-                        true
-                    } else {
-                        false
-                    }
-                });
+                // unsafe {
+                //     self.stream
+                //         .updateConfiguration_completionHandler(&self.capture_config, None)
+                // };
+                // // use objc2_core_graphics::{CGGetActiveDisplayList, CGDisplayCopyDisplayMode, CGDisplayMode, CGDirectDisplayID};
+                // // let mut active_displays = std::mem::MaybeUninit::<[CGDirectDisplayID; 1]>::uninit();
+                // // let mut display_count = std::mem::MaybeUninit::<u32>::uninit();
+                // // unsafe { CGGetActiveDisplayList(1, &raw mut (&mut *active_displays.as_mut_ptr())[0], display_count.as_mut_ptr()) };
+                // // let active_displays = unsafe { active_displays.assume_init() };
+                // // let display_count = unsafe { display_count.assume_init() };
+                // // if display_count == 0 {
+                // //     panic!("No active displays found");
+                // // }
+                // // let display = active_displays[0];
+                // // let display_mode = unsafe { CGDisplayCopyDisplayMode(display) }.unwrap();
+                // self.display_size.send_if_modified(|screen_size| {
+                //     if screen_size.client != (width, height) {
+                //         tracing::info!("Client display size changed: {} x {}", width, height);
+                //         screen_size.client = (width, height);
+                //         true
+                //     } else {
+                //         false
+                //     }
+                // });
             }
             Job::CaptureStart(sender) => {
                 let screen_size = *self.display_size.borrow();
@@ -300,39 +439,56 @@ impl super::ScreenCaptureContext {
                     * (screen_size.server.1 as usize);
                 let (capture_sender, capture_receiver) =
                     triple_buffer::triple_buffer(&CapturedData {
-                        data: Vec::with_capacity(buffer_size),
+                        data: vec![0u8; buffer_size],
                         width: screen_size.server.0 as _,
                         height: screen_size.server.1 as _,
                         x: 0,
                         y: 0,
+                        stride: BYTES_PER_PIXEL * (screen_size.server.0 as usize),
                     });
                 let update_notification = Arc::new(Notify::new());
-                let delegate = DisplayCaptureDelegate {
-                    sender: RefCell::new(capture_sender),
-                    update_notifier: update_notification.clone(),
-                    capture_counter: RefCell::new(self.capture_counter.clone()),
-                };
-                let ret = self
-                    .stream
-                    .add_output_handler(delegate, SCStreamOutputType::Screen)
-                    .context("Failed to start add stream output")
-                    .map(|index| DisplayUpdates {
-                        index: ScreenOutputIndex::new(index),
-                        display_sender: self.job_sender.clone(),
-                        update_notification,
-                        capture_receiver,
-                        display_size: self.display_size.subscribe(),
-                        send_counter: self.send_counter.clone(),
-                    });
+                let delegate = DisplayCaptureDelegate::new(
+                    capture_sender,
+                    update_notification.clone(),
+                    self.capture_counter.clone(),
+                );
+                let delegate = ProtocolObject::from_retained(delegate);
+                let dispatch_queue = DispatchQueue::new("app.perlmint.arisu.display", None);
+                let ret = unsafe {
+                    self.stream.addStreamOutput_type_sampleHandlerQueue_error(
+                        &delegate,
+                        SCStreamOutputType::Screen,
+                        Some(&dispatch_queue),
+                    )
+                }
+                .map(|_| DisplayUpdates {
+                    display_sender: self.job_sender.clone(),
+                    update_notification,
+                    capture_receiver,
+                    display_size: self.display_size.subscribe(),
+                    send_counter: self.send_counter.clone(),
+                })
+                .map_err(|e| anyhow!("Failed to add display output: {e:?}"));
                 tracing::info!("Display capture started");
+                if ret.is_ok() {
+                    self.display_delegate = Some((delegate, dispatch_queue.into()));
+                }
                 if sender.send(ret).is_err() {
                     tracing::error!("Failed to send DisplayUpdates");
                 }
             }
-            Job::CaptureStop(index) => {
-                tracing::info!("Stopping display capture");
-                self.stream
-                    .remove_output_handler(index.to_raw(), SCStreamOutputType::Screen);
+            Job::CaptureStop => {
+                if let Some((output, _)) = self.display_delegate.take() {
+                    tracing::info!("Removing display output");
+                    if let Err(e) = unsafe {
+                        self.stream
+                            .removeStreamOutput_type_error(&output, SCStreamOutputType::Screen)
+                    } {
+                        tracing::error!("Failed to remove display output: {e:?}");
+                    };
+                } else {
+                    tracing::warn!("No display delegate found to stop");
+                }
             }
         }
     }

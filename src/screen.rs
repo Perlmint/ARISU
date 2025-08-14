@@ -1,37 +1,24 @@
+use anyhow::Context as _;
+use dispatch2::DispatchQueue;
 use ironrdp::server::ServerEvent;
-use objc::runtime::Object;
-use screencapturekit::{
-    shareable_content::SCShareableContent,
-    stream::{
-        configuration::{pixel_format::PixelFormat, SCStreamConfiguration},
-        content_filter::SCContentFilter,
-        SCStream,
-    },
+use objc2::{rc::Retained, runtime::ProtocolObject, AnyThread as _};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_video::kCVPixelFormatType_32BGRA;
+use objc2_foundation::{NSArray, NSError};
+use objc2_screen_capture_kit::{
+    SCCaptureDynamicRange, SCCaptureResolutionType, SCContentFilter, SCShareableContent, SCStream,
+    SCStreamConfiguration, SCStreamOutput,
 };
 use std::sync::{Arc, RwLock};
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     task::{JoinHandle, LocalSet},
 };
 
 use crate::{counter::IntervalCounter, input::InputHandler};
 
 mod display;
-
 mod sound;
-
-#[derive(Clone, Copy)]
-struct ScreenOutputIndex(usize);
-
-impl ScreenOutputIndex {
-    fn new(val: *mut Object) -> Self {
-        Self(val as usize)
-    }
-
-    fn to_raw(self) -> *mut Object {
-        self.0 as *mut _
-    }
-}
 
 enum ScreenJob {
     Display(display::Job),
@@ -58,51 +45,86 @@ struct ScreenCaptureContext {
     rdp_event_sender: Arc<RwLock<Option<mpsc::UnboundedSender<ServerEvent>>>>,
     capture_counter: IntervalCounter,
     send_counter: IntervalCounter,
-    stream: SCStream,
+    stream: Retained<SCStream>,
+    capture_config: Retained<SCStreamConfiguration>,
+    display_delegate: Option<(
+        Retained<ProtocolObject<dyn SCStreamOutput>>,
+        Retained<DispatchQueue>,
+    )>,
+    audio_delegate: Option<(
+        Retained<ProtocolObject<dyn SCStreamOutput>>,
+        Retained<DispatchQueue>,
+    )>,
 }
 
 impl ScreenCapture {
-    pub fn new(
+    pub async fn new(
         main_thread_local_set: &LocalSet,
         capture_counter: IntervalCounter,
         display_send_counter: IntervalCounter,
     ) -> anyhow::Result<(Self, JoinHandle<anyhow::Result<()>>)> {
-        let config = SCStreamConfiguration::new()
-            .set_captures_audio(true)
-            .map_err(|e| anyhow::anyhow!("Failed to setCapturesAudio - {e:?}"))?
-            // .set_sample_rate(sound::SAMPLE_RATE as _)
-            // .map_err(|e| anyhow::anyhow!("Failed to setSampleRate - {e:?}"))?
-            .set_channel_count(sound::CHANNELS as _)
-            .map_err(|e| anyhow::anyhow!("Failed to setChannelCount - {e:?}"))?
-            .set_pixel_format(PixelFormat::BGRA)
-            .map_err(|e| anyhow::anyhow!("Failed setPixelFormat - {e:?}"))?;
         let screen_chnnal = mpsc::channel::<ScreenJob>(10);
         let display = {
-            let shareable_content = SCShareableContent::get()
-                .map_err(|e| anyhow::anyhow!("Failed to get SCShareableContent - {e:?}"))?;
-            let mut displays = shareable_content.displays();
-            displays.swap_remove(0)
+            let (tx, rx) = oneshot::channel();
+            let block = block2::RcBlock::new({
+                let tx = std::cell::Cell::new(Some(tx));
+                move |shareable_content: *mut SCShareableContent, _error: *mut NSError| {
+                    let shareable_content = unsafe { &mut *shareable_content };
+                    let displays = unsafe { shareable_content.displays() }
+                        .firstObject()
+                        .ok_or(anyhow::anyhow!("No displays found"));
+                    if tx.take().unwrap().send(displays).is_err() {
+                        tracing::error!("Failed to send shareable content");
+                    }
+                }
+            });
+            unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&block) };
+            rx.await.context("Failed to get shareable content")??
         };
 
         let rdp_event_sender: Arc<RwLock<Option<mpsc::UnboundedSender<ServerEvent>>>> =
             Default::default();
 
-        let filter = SCContentFilter::new().with_display_excluding_applications_excepting_windows(
-            &display,
-            &[],
-            &[],
-        );
-        let width = display.width() as u16;
-        let height = display.height() as u16;
+        let filter = unsafe {
+            SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+                SCContentFilter::alloc(),
+                &display,
+                &NSArray::new(),
+                &NSArray::new(),
+            )
+        };
+        let width = unsafe { display.width() as u16 };
+        let height = unsafe { display.height() as u16 };
         tracing::info!("screen initial size - width: {width}, height: {height}");
+
+        let config = unsafe { SCStreamConfiguration::new() };
+        unsafe {
+            config.setCapturesAudio(true);
+            config.setSampleRate(sound::SAMPLE_RATE as _);
+            config.setChannelCount(sound::CHANNELS as _);
+            config.setPixelFormat(kCVPixelFormatType_32BGRA);
+            config.setCaptureResolution(SCCaptureResolutionType::Best);
+            config.setWidth(width as _);
+            config.setHeight(height as _);
+            config.setSourceRect(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(width as _, height as _)));
+            config.setDestinationRect(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(width as _, height as _)));
+            config.setPreservesAspectRatio(true);
+            config.setCaptureDynamicRange(SCCaptureDynamicRange::SDR);
+        }
+
         let (display_size, screen_size) = watch::channel(ScreenSize {
             client: (width, height),
             server: (width, height),
         });
-        let stream = SCStream::new(&filter, &config);
-        stream
-            .start_capture()
-            .map_err(|e| anyhow::anyhow!("Failed to start capture - {e:?}"))?;
+        let stream = unsafe {
+            SCStream::initWithFilter_configuration_delegate(
+                SCStream::alloc(),
+                &filter,
+                &config,
+                None,
+            )
+        };
+        unsafe { stream.startCaptureWithCompletionHandler(None) };
 
         let mut context = ScreenCaptureContext {
             job_sender: screen_chnnal.0.clone(),
@@ -110,7 +132,10 @@ impl ScreenCapture {
             capture_counter,
             send_counter: display_send_counter,
             display_size,
+            capture_config: config,
             stream,
+            display_delegate: None,
+            audio_delegate: None,
         };
         let handle = main_thread_local_set.spawn_local(async move {
             let mut job_receiver = screen_chnnal.1;
@@ -165,8 +190,6 @@ impl ScreenCaptureContext {
             *sender = None;
         }
 
-        if let Err(e) = self.stream.stop_capture() {
-            tracing::error!("Failed to stop capture stream: {:?}", e);
-        }
+        unsafe { self.stream.stopCaptureWithCompletionHandler(None) };
     }
 }
